@@ -143,6 +143,17 @@ class DistributionItemOut(BaseModel):
     authorization: AuthorizationOut
 
 
+class DistributionReschedule(BaseModel):
+    """发行申请改期：仅更换发行时刻，地区/渠道/素材清单不变。"""
+
+    occur_at: datetime = Field(description="新的发行时刻（带时区）")
+
+    @field_validator("occur_at")
+    @classmethod
+    def _occur_aware(cls, v: datetime) -> datetime:
+        return _ensure_aware(v, "occur_at")
+
+
 # ------------------------------------------------------- 授权退役改挂
 class AuthorizationMigrationRequest(BaseModel):
     """原授权退役：将其承载的全部未撤销申请一次性改挂到替代授权。"""

@@ -1,6 +1,6 @@
 # 素材发行授权核验 HTTP API
 
-为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询与**一次性撤销（释放占用）**、授权退役时的**一次性改挂**，并支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期）。
+为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，并支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Pydantic v2
 - 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额、不重复释放**
@@ -82,6 +82,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/distributions` | **提交发行申请：整体核验并原子占用** |
 | `GET` | `/distributions/{id}` | 查询发行申请（含各项命中授权） |
 | `POST` | `/distributions/{id}/revoke` | **撤销申请（仅可一次），释放占用次数** |
+| `POST` | `/distributions/{id}/reschedule` | **改期：以新的带时区发行时刻调整档期，原子重选各项授权** |
 | `POST` | `/reservations` | **预留发行额度：全部素材同时通过才生成预留编号并逐项占额** |
 | `GET` | `/reservations` | 查询预留列表（`?status=pending/confirmed/cancelled/expired` 过滤） |
 | `GET` | `/reservations/{id}` | 查询单个预留（读取时惰性结算到期状态） |
@@ -105,6 +106,33 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
    已通过申请仍可查询、可撤销。
 7. **撤销**：已通过申请仅可成功撤销一次；撤销后逐项释放占用次数，
    申请记录保留且状态变为 `revoked`，仍可查询。重复撤销返回 `409`。
+
+### 发行申请改期规则
+
+运营用**申请编号 + 新的带时区发行时刻**（`POST /distributions/{id}/reschedule`，
+请求体 `{"occur_at": "..."}`）调整一笔**已通过（`approved`）**申请的档期；
+**地区、渠道与素材清单不变**，仅更换发行时刻：
+
+1. **同一瞬间幂等**：新时刻与当前时刻为同一瞬间（仅时区表示不同也算，
+   如 `2026-10-15T12:00:00+08:00` 与 `2026-10-15T04:00:00Z`）时，
+   **返回原申请、不变更任何次数**（该空操作不要求授权仍启用）。
+2. **逐项重选**：否则按既有**左闭右开**匹配
+   （`starts_at <= occur_at < ends_at`）与**重叠授权顺序**
+   （到期早优先、其次编号小）为每个素材重选授权；**余量判定扣除本申请
+   原占用**（该授权 `used_count` 先减回本申请占的 1 次，故 `max_count=1`
+   的授权也能自我承接），**仍计入未到期预留**（`reserved_count` 正常
+   占额），且**目标授权必须启用**。
+3. **原子更新**：全部项都可承接才在一个事务内更新申请 `occur_at`、
+   逐项明细归属与相关授权次数（归属不变的授权次数不动；归属变化的
+   「原授权 `-1`、新授权 `+1`」），返回更新后的申请；**任一项失败则
+   整体拒绝**（`reschedule_rejected`，逐项列明原因），原申请时刻、
+   明细归属与所有授权次数均不变。
+4. **已撤销申请拒绝改期**（409 `distribution_revoked`，即使新时刻为
+   同一瞬间）；未知申请编号返回 404。
+5. **预留确认生成的申请同样可改期**：预留的原始 `occur_at` 与确认记录
+   （`confirmed_at`、关联申请编号）保留不变；预留查询（单条/列表）内嵌的
+   申请展示改期后的**最新数据**。改期后的申请仍适用既有约定：可查询、
+   可撤销（撤销释放改期后归属的授权）、可参与授权改挂。
 
 ### 授权退役改挂规则
 
@@ -200,9 +228,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 422 | `unknown_material` | 登记授权/发行申请/预留引用了未知素材编号 |
 | 422 | `duplicate_material_items` | 同一发行申请/预留中携带重复素材 |
 | 422 | `distribution_rejected` | 核验未通过；`details` 按项列明原因（见下） |
+| 422 | `reschedule_rejected` | 改期核验未通过；`details` 按项列明原因（见下），原记录与次数均不变 |
 | 422 | `reservation_rejected` | 预留核验未通过；`details` 按项列明原因（见下），不占任何额度 |
 | 422 | `migration_rejected` | 授权改挂核验未通过；`details` 列明原因（见下），归属与次数均不变 |
 | 409 | `already_revoked` | 对已撤销申请重复撤销 |
+| 409 | `distribution_revoked` | 对已撤销申请改期 |
 | 409 | `reservation_already_confirmed` | 对已确认预留执行取消 |
 | 409 | `reservation_already_cancelled` | 重复取消已取消预留（不再释放额度） |
 | 409 | `reservation_cancelled` | 已取消预留之后再确认 |
@@ -210,10 +240,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 422 | `invalid_reservation_status` | 预留列表使用了不支持的状态过滤值 |
 | 404 | `not_found` | 路径中的素材/授权/申请/预留编号不存在（改挂时原/替代授权任一不存在） |
 
-`distribution_rejected` / `reservation_rejected` 的逐项原因 `reason`：
+`distribution_rejected` / `reschedule_rejected` / `reservation_rejected`
+的逐项原因 `reason`：
 
 - `no_matching_authorization`：没有同时匹配地区、渠道与发行时刻的授权
-- `authorization_inactive`：匹配的授权均已停用（停用只影响新申请/新预留）
+- `authorization_inactive`：匹配的授权均已停用（停用只影响新申请/新预留/改期重选）
 - `quota_exhausted`：匹配授权的可发行/可预留次数已用尽（正式占用 + 未到期预留）
 
 `migration_rejected` 的原因 `reason`（`details` 中附带两端授权编号）：
@@ -297,6 +328,41 @@ curl -s -X POST http://localhost:8000/api/v1/authorizations/migrate \
 # 改挂后查询申请显示替代授权；仍可用原接口撤销，撤销只释放替代授权一次
 curl -s http://localhost:8000/api/v1/distributions/1
 curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
+```
+
+### 改期操作示例（curl）
+
+```bash
+# 前提：申请 1 为 approved（地区 CN / 渠道 web / 素材清单不变）
+# 13) 改期：把申请 1 调整到新的发行时刻（带时区）
+curl -s -X POST http://localhost:8000/api/v1/distributions/1/reschedule \
+  -H 'Content-Type: application/json' \
+  -d '{"occur_at": "2026-10-20T09:00:00+08:00"}'
+# 200：返回更新后的申请——occur_at 已变；每个素材按左闭右开匹配与
+#      重叠授权顺序（到期早优先、其次编号小）重选授权，归属变化的项
+#      「原授权 used_count-1、新授权 +1」已原子搬移，归属不变则次数不动。
+#      余量判定已扣除本申请原占用，未到期预留仍占额，目标授权须启用。
+
+# 14) 同一瞬间幂等：与当前时刻相同的瞬间（时区表示可不同）
+curl -s -X POST http://localhost:8000/api/v1/distributions/1/reschedule \
+  -H 'Content-Type: application/json' \
+  -d '{"occur_at": "2026-10-20T01:00:00Z"}'   # 即 09:00+08:00
+# 200：返回原申请，任何授权次数均不变
+
+# 15) 失败与拒绝
+# 任一项不可承接（无匹配/目标停用/余量不足）
+#   -> 422 reschedule_rejected，details 逐项列明原因，原记录与次数均不变
+# 已撤销的申请改期（即使同一瞬间）
+#   -> 409 distribution_revoked
+# 申请编号不存在 -> 404 not_found；occur_at 缺时区 -> 422
+
+# 16) 由预留确认生成的申请同样可改期；预留的原始 occur_at 与确认记录保留，
+#     预留查询内嵌的申请展示改期后的最新数据
+curl -s -X POST http://localhost:8000/api/v1/distributions/2/reschedule \
+  -H 'Content-Type: application/json' \
+  -d '{"occur_at": "2026-10-21T10:00:00+08:00"}'
+curl -s http://localhost:8000/api/v1/reservations/1
+# reservation.occur_at 仍为预留原始时刻；distribution.occur_at 为改期后时刻
 ```
 
 ### 预留操作示例（curl）
@@ -424,8 +490,8 @@ curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
 ```
 
 1. **通道咨询锁 `pg_advisory_xact_lock`**：按 `region+channel` 分桶，
-   同一通道内的提交、预留、确认、取消、撤销、改挂由此串行判定，消除
-   「各自读到有余量、先后扣减导致超额」以及「确认/取消/改挂交错读到
+   同一通道内的提交、预留、确认、取消、撤销、改期、改挂由此串行判定，消除
+   「各自读到有余量、先后扣减导致超额」以及「确认/取消/改期/改挂交错读到
    一半旧状态」的竞态；事务提交/回滚时自动释放（同事务内重入同把锁安全）。
    授权行只会被同通道事务竞争（匹配维度即 region+channel，改挂也要求
    两端通道一致），因此不同通道不争用同一授权行，跨桶不可能成等待环。
@@ -437,16 +503,19 @@ curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
    通道内天然互斥，不会重复释放。无需后台定时任务。
 3. **行锁 `SELECT ... FOR UPDATE`**：预留/申请行锁串行化对同一对象的
    并发确认与取消（恰为一方 200、一方 409）、并发双重确认（均 200 但
-   只生成一笔申请）、并发双重取消（恰为一次 200、一次 409）；授权行
-   始终按 `id` 全局升序加锁；改挂与撤销还锁定相关**明细行**，固定
+   只生成一笔申请）、并发双重取消（恰为一次 200、一次 409）、并发撤销与
+   改期（撤销必先于改期生效，否则改期看到 `revoked` 拒绝）；授权行
+   始终按 `id` 全局升序加锁；改挂、撤销与改期还锁定相关**明细行**，固定
    「明细 → 授权」归属。
 4. **条件更新**：正式占用 `used+reserved < max`、预留占用
    `used+reserved < max`、确认转账（`reserved >= 1` 再
    `used+reserved < max`）、取消/到期释放 `reserved >= n`、
    改挂迁入 `used+reserved <= max-n` / 迁出 `used >= n`、
-   撤销释放 `used >= 1`，全部断言影响行数，作为超额/重复释放的最后防线。
+   撤销释放 `used >= 1`、改期搬移「原授权 `used >= 1` 再新授权
+   `used+reserved < max`」，全部断言影响行数，作为超额/重复释放的
+   最后防线。
 
-核验/预留/改挂不通过即 `ROLLBACK`，不产生任何次数或归属变化。任意时刻
+核验/预留/改期/改挂不通过即 `ROLLBACK`，不产生任何次数或归属变化。任意时刻
 都有不变量：
 
 - `used_count` 恒等于归属该授权且处于 `approved` 状态的占用明细数；
@@ -472,6 +541,13 @@ curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
   原因、可预留余量、到期左闭右开与到期即释放、确认转申请/重复确认同一笔、
   取消与确认互斥/重复取消不重复释放、四态查询与过滤、停用不影响确认、
   改挂阻断、重叠选择顺序、TTL 1～30 边界等。
+- `tests/test_reschedule.py`：99 项改期端到端用例，覆盖归属不变次数不动、
+  归属搬移「原授权 -1、新授权 +1」、同一瞬间幂等（含授权停用下的空操作）、
+  余量扣除本申请原占用（max=1 自我承接）、未到期预留仍占额、目标须启用、
+  失败整体拒绝的原子性（无匹配/停用/满员/多素材部分失败）、已撤销 409、
+  未知 404、左闭右开边界、预留确认申请改期（预留记录保留、关联申请展示
+  最新）、改期后撤销/改挂约定，以及并发重复改期、改期与撤销竞争、
+  改期与新申请竞争单槽（绝不超额、账实相符）。
 - `tests/test_concurrency.py`：既有并发安全用例（20/30 并发抢占、多素材批量、
   撤销与新申请交错、并发双重撤销、**改挂与撤销并发、改挂与提交并发、
   并发重复改挂**），断言绝不超额、不重复释放且账实相符。
@@ -488,6 +564,7 @@ export DATABASE_URL="postgresql+psycopg://licensing@localhost:5432/licensing"
 python3 -m tests.test_api
 python3 -m tests.test_migrate
 python3 -m tests.test_reservation_api
+python3 -m tests.test_reschedule
 python3 -m tests.test_concurrency
 python3 -m tests.test_reservations
 ```
@@ -510,13 +587,14 @@ python3 -m tests.test_reservations
 │   ├── models.py      # Material / Authorization / Distribution(+Item) /
 │   │                  # Reservation(+Item)
 │   ├── schemas.py     # 请求响应模型与时段/时区/TTL 校验
-│   ├── errors.py      # 业务错误码（含预留四态冲突码）
+│   ├── errors.py      # 业务错误码（含预留四态冲突码与改期拒绝码）
 │   └── services.py    # 核验占用 / 预留 / 确认 / 取消 / 到期结算 /
-│                      # 撤销 / 改挂（核心事务逻辑）
+│                      # 撤销 / 改期 / 改挂（核心事务逻辑）
 └── tests/
     ├── test_api.py
     ├── test_migrate.py
     ├── test_reservation_api.py
+    ├── test_reschedule.py
     ├── test_reservations.py
     └── test_concurrency.py
 ```

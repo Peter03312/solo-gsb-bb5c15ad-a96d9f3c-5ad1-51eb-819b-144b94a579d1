@@ -79,6 +79,29 @@ class AlreadyRevoked(APIError):
         )
 
 
+class DistributionRevoked(APIError):
+    """已撤销的申请不可改期。"""
+
+    def __init__(self, distribution_id: int):
+        super().__init__(
+            status_code=409,
+            code="distribution_revoked",
+            message=f"发行申请已撤销，不可改期：{distribution_id}",
+        )
+
+
+class RescheduleRejected(APIError):
+    """改期核验未通过：整体拒绝，原申请时刻、明细归属与授权次数均不变。"""
+
+    def __init__(self, reasons: list[dict]):
+        super().__init__(
+            status_code=422,
+            code="reschedule_rejected",
+            message="改期核验未通过，原申请发行时刻、明细归属与授权次数均未变更",
+            details=reasons,
+        )
+
+
 class MigrationRejected(APIError):
     """授权退役改挂核验未通过：整体拒绝，归属与次数均不变。"""
 
