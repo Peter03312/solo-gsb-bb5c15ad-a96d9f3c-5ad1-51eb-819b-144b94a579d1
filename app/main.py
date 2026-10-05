@@ -19,10 +19,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="素材发行授权核验 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
         "对发行申请做整体核验、原子占用，支持查询、一次性撤销、"
+        "已通过申请改期（按新发行时刻重选授权、原子搬移占用）、"
         "授权退役时将未撤销申请一次性改挂到替代授权；"
         "并支持 1～30 分钟有效期的发行额度预留（待确认/确认/取消/过期）。"
     ),
@@ -154,6 +155,20 @@ def revoke_distribution(
     distribution_id: int, db: Session = Depends(get_db)
 ):
     return services.revoke_distribution(db, distribution_id)
+
+
+@app.post(
+    "/api/v1/distributions/{distribution_id}/reschedule",
+    response_model=schemas.DistributionOut,
+    tags=["distributions"],
+    summary="已通过申请改期：按新发行时刻重选授权并原子搬移占用",
+)
+def reschedule_distribution(
+    distribution_id: int,
+    body: schemas.DistributionReschedule,
+    db: Session = Depends(get_db),
+):
+    return services.reschedule_distribution(db, distribution_id, body)
 
 
 # ------------------------------------------------------------------ 预留

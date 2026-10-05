@@ -667,6 +667,228 @@ def scenario_double_migrate_race() -> None:
     )
 
 
+def scenario_reschedule_vs_submit() -> None:
+    """一笔申请改期迁入目标授权，与并发新申请竞争同一目标余量。
+
+    目标授权容量 3：改期申请自身在目标授权无原占用（占用随迁移而来），
+    与 15 笔直接落在目标时段的新申请竞争。最终目标 used 必须恒等于
+    成功的迁入 + 成功的新申请，且绝不超额；源授权最终为 0（迁入成功）
+    或仍持 1（迁入失败），账目守恒。
+    """
+    print("== 场景8：改期迁入与新申请并发竞争目标余量（不超额） ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c8", "name": "改期竞争"}
+    ).json()["id"]
+    src = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "RR",
+            "channel": "web",
+            "starts_at": (NOW - timedelta(days=2)).isoformat(),
+            "ends_at": (NOW + timedelta(hours=1)).isoformat(),
+            "max_count": 5,
+        },
+    ).json()["id"]
+    tgt = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "RR",
+            "channel": "web",
+            "starts_at": (NOW + timedelta(days=1)).isoformat(),
+            "ends_at": (NOW + timedelta(days=4)).isoformat(),
+            "max_count": 3,
+        },
+    ).json()["id"]
+    did = client.post(
+        "/api/v1/distributions",
+        json={
+            "material_ids": [mid],
+            "region": "RR",
+            "channel": "web",
+            "occur_at": NOW.isoformat(),
+        },
+    ).json()["id"]
+    new_time = NOW + timedelta(days=2)
+
+    def reschedule():
+        c = TestClient(app)
+        r = c.post(
+            f"/api/v1/distributions/{did}/reschedule",
+            json={"occur_at": new_time.isoformat()},
+        )
+        return r.status_code
+
+    def submit(_):
+        c = TestClient(app)
+        r = c.post(
+            "/api/v1/distributions",
+            json={
+                "material_ids": [mid],
+                "region": "RR",
+                "channel": "web",
+                "occur_at": new_time.isoformat(),
+            },
+        )
+        return r.status_code
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        f_resv = pool.submit(reschedule)
+        f_subs = [pool.submit(submit, i) for i in range(15)]
+        code_r = f_resv.result()
+        codes = [f.result() for f in f_subs]
+
+    moved = code_r == 200
+    if code_r not in (200, 422):
+        raise AssertionError(f"改期返回异常：{code_r}")
+
+    db = SessionLocal()
+    try:
+        src_used = db.get(models.Authorization, src).used_count
+        tgt_used = db.get(models.Authorization, tgt).used_count
+        tgt_items = db.scalar(
+            select(func.count())
+            .select_from(models.DistributionItem)
+            .join(
+                models.Distribution,
+                models.DistributionItem.distribution_id
+                == models.Distribution.id,
+            )
+            .where(
+                models.DistributionItem.authorization_id == tgt,
+                models.Distribution.status == "approved",
+            )
+        )
+        src_items = db.scalar(
+            select(func.count())
+            .select_from(models.DistributionItem)
+            .join(
+                models.Distribution,
+                models.DistributionItem.distribution_id
+                == models.Distribution.id,
+            )
+            .where(
+                models.DistributionItem.authorization_id == src,
+                models.Distribution.status == "approved",
+            )
+        )
+        occur = db.get(models.Distribution, did).occur_at
+    finally:
+        db.close()
+
+    new_ok = codes.count(201)
+    assert tgt_used <= 3, f"目标授权超额：{tgt_used}"
+    assert tgt_used == tgt_items, "目标账实不符"
+    assert src_used == src_items, "源授权账实不符"
+    assert tgt_used == new_ok + (1 if moved else 0), (
+        f"目标占用={tgt_used} 应=新申请成功{new_ok}+迁入{1 if moved else 0}"
+    )
+    assert src_used == (0 if moved else 1), (
+        f"源占用={src_used} 应={'0(已迁出)' if moved else '1(未迁出)'}"
+    )
+    if moved:
+        from datetime import timezone as _tz
+
+        assert occur.astimezone(_tz.utc) == new_time.astimezone(_tz.utc)
+    new_rej = sum(
+        1 for code in codes if code == 422
+    )
+    print(
+        f"  PASS  改期迁入={'成功' if moved else '被拒'}，"
+        f"新申请成功={new_ok} 拒绝={new_rej}，"
+        f"src={src_used} tgt={tgt_used}/3（不超额、账实相符）"
+    )
+
+
+def scenario_double_reschedule_race() -> None:
+    """同一笔申请并发改期到两个不同时刻：串行化，最终归属与账目自洽。"""
+    print("== 场景9：同一申请并发改期到不同授权（串行化、账实相符） ==")
+    client = TestClient(app)
+    mid = client.post(
+        "/api/v1/materials", json={"code": "c9", "name": "并发改期"}
+    ).json()["id"]
+    # 旧时刻仅 old 覆盖；t1 时刻 old+t1auth 均覆盖；t2 时刻仅 t2auth 覆盖。
+    old = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "RS",
+            "channel": "web",
+            "starts_at": (NOW - timedelta(days=2)).isoformat(),
+            "ends_at": (NOW + timedelta(days=2)).isoformat(),
+            "max_count": 5,
+        },
+    ).json()["id"]
+    t2auth = client.post(
+        "/api/v1/authorizations",
+        json={
+            "material_id": mid,
+            "region": "RS",
+            "channel": "web",
+            "starts_at": (NOW + timedelta(days=3)).isoformat(),
+            "ends_at": (NOW + timedelta(days=8)).isoformat(),
+            "max_count": 5,
+        },
+    ).json()["id"]
+    did = client.post(
+        "/api/v1/distributions",
+        json={
+            "material_ids": [mid],
+            "region": "RS",
+            "channel": "web",
+            "occur_at": NOW.isoformat(),
+        },
+    ).json()["id"]
+    t1 = NOW + timedelta(days=1)
+    t2 = NOW + timedelta(days=4)
+
+    def move(when):
+        c = TestClient(app)
+        return c.post(
+            f"/api/v1/distributions/{did}/reschedule",
+            json={"occur_at": when.isoformat()},
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        codes = list(pool.map(move, (t1, t2)))
+    assert sorted(codes) == [200, 200], f"两次改期均应成功：{codes}"
+
+    db = SessionLocal()
+    try:
+        d = db.get(models.Distribution, did)
+        final_item = db.scalars(
+            select(models.DistributionItem).where(
+                models.DistributionItem.distribution_id == did
+            )
+        ).one()
+        old_used = db.get(models.Authorization, old).used_count
+        t2_used = db.get(models.Authorization, t2auth).used_count
+        from datetime import timezone as _tz
+
+        final_occur = d.occur_at.astimezone(_tz.utc)
+    finally:
+        db.close()
+
+    # 后提交的改期胜出：最终时刻必为 t1 或 t2，归属与其唯一匹配一致。
+    assert final_occur in (
+        t1.astimezone(timezone.utc),
+        t2.astimezone(timezone.utc),
+    ), f"最终时刻异常：{final_occur}"
+    if final_occur == t1.astimezone(timezone.utc):
+        # t1 时刻 old 到期早于 t2auth（t2auth 尚未开始），只有 old 覆盖。
+        assert final_item.authorization_id == old
+        assert old_used == 1 and t2_used == 0
+    else:
+        assert final_item.authorization_id == t2auth
+        assert old_used == 0 and t2_used == 1
+    print(
+        f"  PASS  并发改期均成功，最终时刻={final_occur.isoformat()}，"
+        f"old={old_used} t2auth={t2_used}（归属自洽、次数守恒）"
+    )
+
+
 def main() -> int:
     Base.metadata.drop_all(bind=engine)
     init_db()
@@ -678,6 +900,8 @@ def main() -> int:
         scenario_migrate_vs_revoke()
         scenario_migrate_vs_submit()
         scenario_double_migrate_race()
+        scenario_reschedule_vs_submit()
+        scenario_double_reschedule_race()
     print("\n全部并发场景通过：未发生超额、账实相符。")
     return 0
 

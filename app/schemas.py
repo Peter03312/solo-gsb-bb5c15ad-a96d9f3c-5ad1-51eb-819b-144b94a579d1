@@ -135,6 +135,20 @@ class DistributionCreate(BaseModel):
         return _ensure_aware(v, "occur_at")
 
 
+class DistributionReschedule(BaseModel):
+    """已通过申请改期：仅携带新的带时区发行时刻。
+
+    地区、渠道与素材清单沿用原申请，不可修改。
+    """
+
+    occur_at: datetime = Field(description="新的发行时刻（必须带时区）")
+
+    @field_validator("occur_at")
+    @classmethod
+    def _occur_aware(cls, v: datetime) -> datetime:
+        return _ensure_aware(v, "occur_at")
+
+
 class DistributionItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

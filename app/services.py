@@ -45,10 +45,12 @@ from app import models
 from app.errors import (
     AlreadyRevoked,
     DistributionRejected,
+    DistributionRevoked,
     DuplicateMaterialItems,
     InvalidReservationStatus,
     MigrationRejected,
     MaterialCodeTaken,
+    RescheduleRejected,
     ReservationAlreadyCancelled,
     ReservationAlreadyConfirmed,
     ReservationCancelled,
@@ -61,6 +63,7 @@ from app.schemas import (
     AuthorizationCreate,
     AuthorizationMigrationRequest,
     DistributionCreate,
+    DistributionReschedule,
     MaterialCreate,
     ReservationCreate,
 )
@@ -289,14 +292,23 @@ def _evaluate(
     channel: str,
     occur: datetime,
     for_reservation: bool,
+    exclude_used: dict[int, int] | None = None,
 ) -> tuple[dict[int, models.Authorization], list[dict]]:
     """沿用既有授权匹配与重叠选择顺序做逐项判定。
 
     选择顺序：匹配（素材/地区/渠道/左闭右开时段）→ 仅启用 →
     ``(ends_at 升序, id 升序)`` → 第一条有余量者。余量对正式申请按
     ``used + reserved < max``（未到期预留占额），预留申请同理（预留同样
-    不得超额）。返回 ``(逐项命中授权, 失败原因列表)``。
+    不得超额）。
+
+    ``exclude_used`` 用于已通过申请改期：若候选授权正是本申请该项当前
+    占用的授权，则计算余量时扣除这 1 个原占用（额度随改期「搬走」，
+    留在原授权时视为先释放再占回）；未到期预留 ``reserved_count`` 不做
+    扣除，仍照常占额。由于授权绑定单一素材、申请内素材唯一，不同项的
+    候选授权集合互不相交，无需跨项累计。返回 ``(逐项命中授权, 失败原因
+    列表)``。
     """
+    excl = exclude_used or {}
     grouped: dict[int, list[models.Authorization]] = {
         mid: [] for mid in material_ids
     }
@@ -340,22 +352,24 @@ def _evaluate(
             (
                 a
                 for a in active
-                if a.used_count + a.reserved_count < a.max_count
+                if a.used_count - excl.get(a.id, 0) + a.reserved_count
+                < a.max_count
             ),
             None,
         )
         if with_quota is None:
             detail = active[0]
+            eff_used = detail.used_count - excl.get(detail.id, 0)
             if for_reservation:
                 message = (
                     f"匹配授权（id={detail.id}）可预留额度已用尽："
-                    f"正式占用 {detail.used_count}、未到期预留 "
+                    f"正式占用 {eff_used}、未到期预留 "
                     f"{detail.reserved_count}/{detail.max_count}"
                 )
             else:
                 message = (
                     f"匹配授权（id={detail.id}）可发行次数已用尽："
-                    f"{detail.used_count}/{detail.max_count}"
+                    f"{eff_used}/{detail.max_count}"
                     + (
                         f"（另有未到期预留 {detail.reserved_count}）"
                         if detail.reserved_count
@@ -600,6 +614,224 @@ def revoke_distribution(
         raise
 
     return get_distribution(db, distribution_id=distribution_id)
+
+
+# ------------------------------------------------------- 已通过申请改期
+def reschedule_distribution(
+    db: Session,
+    distribution_id: int,
+    data: DistributionReschedule,
+) -> models.Distribution:
+    """运营调整一笔 **已通过（approved）** 申请的发行时刻。
+
+    - 地区、渠道与素材清单不变，仅更新带时区的发行时刻，逐项授权按
+      既有左闭右开匹配与重叠选择顺序（到期早优先、其次编号小）重选，
+      目标授权必须处于启用状态；
+    - **同一瞬间**（时区表示不同但 UTC 时刻一致）直接返回原申请，
+      明细归属与各授权次数一律不变，不占用改期次数；
+    - 余量判定时**扣除本申请的原占用**（该项当前归属的授权视为先释放
+      再判定；授权绑定单一素材、申请内素材唯一，每个授权至多涉及一项），
+      但**未到期预留仍照常占额**（``used - 1 + reserved < max``）；
+    - 所有项都可承接才原子更新申请时刻、明细归属与各授权次数；
+      任一项失败则逐项列明原因，原记录与次数均不变；
+    - 未知申请 → 404；已撤销申请 → 409。
+
+    由已确认预留生成的申请同样可改期：预留的原始 ``occur_at`` 与确认
+    记录保留不变（仍通过 ``reservation_id`` 关联到该申请），预留查询
+    经关联读取到的是改期后的最新申请数据；改期后的申请沿用既有查询、
+    撤销与授权改挂约定。
+
+    并发：单事务内「通道咨询锁（通道维度不变）→ 到期结算（锁原授权与
+    新候选授权）→ 申请行锁 → 授权行锁（id 升序）→ 明细行锁（id 升序）」，
+    与提交/预留/确认/取消/撤销/改挂遵循同一加锁顺序；次数搬移全部使用
+    条件更新并断言影响行数。
+    """
+    head = db.execute(
+        select(
+            models.Distribution.region,
+            models.Distribution.channel,
+            models.Distribution.status,
+            models.Distribution.occur_at,
+        ).where(models.Distribution.id == distribution_id)
+    ).first()
+    if head is None:
+        raise ResourceNotFound("发行申请", distribution_id)
+    region, channel, status, old_occur = head
+    if status == "revoked":
+        raise DistributionRevoked(distribution_id)
+
+    new_occur = data.occur_at
+
+    try:
+        _channel_lock(db, region, channel)
+        now = utcnow()
+
+        # 先无锁读取本申请明细，确定「原归属授权 ∪ 新时刻候选授权」的
+        # 统一行锁集合（授权维度不可变，此读仅用于计算锁集合）。
+        head_items = list(
+            db.scalars(
+                select(models.DistributionItem).where(
+                    models.DistributionItem.distribution_id
+                    == distribution_id
+                )
+            )
+        )
+
+        # 通道到期结算 + 原授权/候选授权统一按 id 升序行锁（原授权不在
+        # 新时刻候选集合时也要锁，次数要从其上迁出）；遵循统一顺序：
+        # 通道锁 → 到期结算/授权行锁 → 申请行锁 → 明细行锁。
+        old_auth_ids = {row.authorization_id for row in head_items}
+        candidate_ids = _candidate_auth_ids(
+            db,
+            [row.material_id for row in head_items],
+            region,
+            channel,
+            new_occur,
+        )
+        lock_ids = sorted(set(candidate_ids) | old_auth_ids)
+        locked_rows = _settle_expired(
+            db,
+            now,
+            region=region,
+            channel=channel,
+            extra_auth_ids=lock_ids,
+        )
+
+        # 再锁定申请行，串行化对同一申请的并发改期，并复查撤销状态。
+        distribution = db.scalar(
+            select(models.Distribution)
+            .where(models.Distribution.id == distribution_id)
+            .with_for_update()
+        )
+        if distribution.status == "revoked":
+            db.rollback()
+            raise DistributionRevoked(distribution_id)
+
+        # 锁定明细行（id 升序），与改挂/撤销事务的明细归属更新互斥。
+        items = list(
+            db.scalars(
+                select(models.DistributionItem)
+                .where(
+                    models.DistributionItem.distribution_id
+                    == distribution_id
+                )
+                .order_by(models.DistributionItem.id.asc())
+                .with_for_update()
+            )
+        )
+
+        # 同一瞬间（按 UTC 比较，时区表示不同也算相同）：直接返回原申请，
+        # 不改时刻、不动归属、不动次数。
+        if old_occur.astimezone(timezone.utc) == new_occur.astimezone(
+            timezone.utc
+        ):
+            db.rollback()
+            return get_distribution(db, distribution_id)
+
+        material_ids = [
+            it.material_id
+            for it in sorted(items, key=lambda it: it.item_index)
+        ]
+
+        # 本申请对各授权的原占用：计算余量时扣除（授权绑定单一素材、
+        # 申请内素材唯一，故每个授权至多出现一条明细）。
+        own_usage: Counter[int] = Counter(
+            it.authorization_id for it in items
+        )
+
+        # 按既有匹配与重叠授权顺序重选；目标授权须启用、余量在扣除本申请
+        # 原占用、计入未到期预留后仍有余量。
+        chosen, reasons = _evaluate(
+            material_ids,
+            locked_rows,
+            region=region,
+            channel=channel,
+            occur=new_occur,
+            for_reservation=False,
+            exclude_used=dict(own_usage),
+        )
+        if reasons:
+            db.rollback()
+            raise RescheduleRejected(reasons)
+
+        # 新归属：素材 id → 命中授权（素材在申请中唯一）。
+        new_auth_by_material = {mid: auth for mid, auth in chosen.items()}
+        item_targets: list[tuple[models.DistributionItem, int]] = [
+            (it, new_auth_by_material[it.material_id].id) for it in items
+        ]
+        move_out: Counter[int] = Counter()
+        move_in: Counter[int] = Counter()
+        for it, target_id in item_targets:
+            if it.authorization_id != target_id:
+                move_out[it.authorization_id] += 1
+                move_in[target_id] += 1
+
+        # 条件搬移次数：先按 id 升序迁出（used >= n 护栏），再按 id 升序
+        # 迁入（扣除本申请占用与未到期预留后不得超额）。统一升序、先出后
+        # 入，杜绝并发事务间的等待环。
+        for auth_id in sorted(move_out):
+            n = move_out[auth_id]
+            result = db.execute(
+                update(models.Authorization)
+                .where(
+                    models.Authorization.id == auth_id,
+                    models.Authorization.used_count >= n,
+                )
+                .values(
+                    used_count=models.Authorization.used_count - n
+                )
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                raise RuntimeError(
+                    f"改期迁出失败：授权 {auth_id} used_count 不足 {n}"
+                )
+        for auth_id in sorted(move_in):
+            n = move_in[auth_id]
+            result = db.execute(
+                update(models.Authorization)
+                .where(
+                    models.Authorization.id == auth_id,
+                    # 该授权在本申请中保留的占用（同授权换时刻）不重复
+                    # 计入迁入；护栏为迁入后 used + reserved <= max。
+                    models.Authorization.used_count
+                    + models.Authorization.reserved_count
+                    <= models.Authorization.max_count - n,
+                )
+                .values(
+                    used_count=models.Authorization.used_count + n
+                )
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                raise RescheduleRejected(
+                    [
+                        {
+                            "reason": "quota_exhausted",
+                            "message": (
+                                f"授权 id={auth_id} 余量不足，"
+                                "并发占用冲突，本次改期整体拒绝"
+                            ),
+                        }
+                    ]
+                )
+
+        # 明细归属改挂 + 申请时刻更新，最后统一提交（原子）。
+        for it, target_id in item_targets:
+            it.authorization_id = target_id
+        distribution.occur_at = new_occur
+        db.commit()
+    except (
+        ResourceNotFound,
+        DistributionRevoked,
+        RescheduleRejected,
+    ):
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    return get_distribution(db, distribution_id)
 
 
 # =============================================================== 额度预留
